@@ -15,7 +15,7 @@ const port = process.env.PORT || 3000;
 // ==================== CORS corrigé (APK Capacitor + Web) ====================
 app.use(cors({
   origin: [
-    'https://lotato1.onrender.com',
+    'https://lotato2.onrender.com',
     'capacitor://localhost',
     'http://localhost',
     'http://localhost:3000',
