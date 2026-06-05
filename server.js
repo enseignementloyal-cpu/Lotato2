@@ -12,20 +12,39 @@ const multer = require('multer');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ==================== CORS corrigé (APK Capacitor + Web) ====================
+// ==================== CORS — Accepte toutes les origines (APK + Web + Dev) ====================
+const allowedOrigins = [
+  'https://lotato2.onrender.com',
+  'https://lotato1.onrender.com',
+  'capacitor://localhost',
+  'http://localhost',
+  'http://localhost:3000',
+  'http://localhost:8080',
+  'http://127.0.0.1',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:8080',
+  'null' // fichiers HTML ouverts directement
+];
+
 app.use(cors({
-  origin: [
-    'https://lotato2.onrender.com',
-    'capacitor://localhost',
-    'http://localhost',
-    'http://localhost:3000',
-    'http://127.0.0.1',
-    'http://127.0.0.1:3000'
-  ],
+  origin: function(origin, callback) {
+    // Autoriser si pas d'origine (Postman, curl, APK natif)
+    if (!origin) return callback(null, true);
+    // Autoriser si dans la liste
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Autoriser en développement
+    if (process.env.NODE_ENV !== 'production') return callback(null, true);
+    // Bloquer les autres en production
+    return callback(null, true); // permissif pour l'instant
+  },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  optionsSuccessStatus: 200
 }));
+
+// Répondre aux preflight OPTIONS
+app.options('*', cors());
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
