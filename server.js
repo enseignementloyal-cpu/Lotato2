@@ -15,7 +15,6 @@ const port = process.env.PORT || 3000;
 // ==================== CORS — Accepte toutes les origines (APK + Web + Dev) ====================
 const allowedOrigins = [
   'https://lotato2.onrender.com',
-  'https://lotato1.onrender.com',
   'capacitor://localhost',
   'http://localhost',
   'http://localhost:3000',
@@ -357,8 +356,8 @@ app.post('/api/auth/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ error: 'Identifiants incorrects' });
 
-    // Vérifier si l'utilisateur est bloqué
-    if (user.blocked) return res.status(403).json({ error: 'Compte bloqué. Contactez votre administrateur.' });
+    // Vérifier si l'utilisateur est bloqué (sauf superadmin)
+    if (user.blocked && user.role !== 'superadmin') return res.status(403).json({ error: 'Compte bloqué. Contactez votre administrateur.' });
 
     const payload = { id: user.id, username: user.username, role: user.role, name: user.name };
     if (user.role === 'agent' || user.role === 'supervisor') {
@@ -425,6 +424,84 @@ app.post('/api/auth/logout', authenticate, async (req, res) => {
   );
   res.json({ success: true, message: 'Déconnexion réussie' });
 });
+// ==================== SETUP TEMPORAIRE (à supprimer après usage) ====================
+// Accéder à /api/setup?pwd=MonMotDePasse pour obtenir le hash bcrypt
+app.get('/api/setup', async (req, res) => {
+  const pwd = req.query.pwd;
+  if (!pwd) return res.json({ error: 'Ajouter ?pwd=VotreMotDePasse dans lURL' });
+  try {
+    const hash = await bcrypt.hash(pwd, 10);
+    res.json({ 
+      password: pwd, 
+      hash,
+      sql_superadmin: `UPDATE users SET password = '${hash}' WHERE username = 'superadmin';`,
+      sql_owner: `UPDATE users SET password = '${hash}' WHERE username = 'owner_test';`,
+      sql_agent: `UPDATE users SET password = '${hash}' WHERE username = 'agent_test';`,
+      note: 'Copier le SQL dans Neon puis supprimer cet endpoint du server.js'
+    });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== Route pour créer les comptes de test ====================
+app.post('/api/setup/create-test-accounts', async (req, res) => {
+  const { secret } = req.body;
+  if (secret !== 'LOTATO_SETUP_2025') {
+    return res.status(403).json({ error: 'Secret invalide' });
+  }
+  try {
+    const hashAdmin  = await bcrypt.hash('Admin1234!', 10);
+    const hashOwner  = await bcrypt.hash('Owner1234!', 10);
+    const hashAgent  = await bcrypt.hash('Agent1234!', 10);
+
+    // Supprimer anciens
+    await pool.query("DELETE FROM users WHERE username IN ('superadmin','owner_test','agent_test')");
+
+    // Superadmin
+    await pool.query(
+      "INSERT INTO users (name, username, password, role, quota, blocked) VALUES ($1,$2,$3,$4,$5,$6)",
+      ['Super Administrateur', 'superadmin', hashAdmin, 'superadmin', 999, false]
+    );
+
+    // Propriétaire test
+    const ownerRes = await pool.query(
+      "INSERT INTO users (name, username, password, role, quota, blocked) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+      ['Propriétaire Test', 'owner_test', hashOwner, 'owner', 10, false]
+    );
+    const ownerId = ownerRes.rows[0].id;
+
+    // Agent test lié au propriétaire
+    await pool.query(
+      "INSERT INTO users (name, username, password, role, owner_id, blocked) VALUES ($1,$2,$3,$4,$5,$6)",
+      ['Agent Test', 'agent_test', hashAgent, 'agent', ownerId, false]
+    );
+
+    // Settings de base pour le propriétaire
+    await pool.query(
+      `INSERT INTO lottery_settings (owner_id, name, slogan, multipliers, limits)
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT (owner_id) DO NOTHING`,
+      [ownerId, 'LOTATO TEST', 'Lotri Ayisyen',
+       JSON.stringify({lot1:60,lot2:20,lot3:10,lotto3:500,lotto4:1000,lotto5:5000,mariage:1000}),
+       JSON.stringify({lotto3:0,lotto4:0,lotto5:0,mariage:0})]
+    );
+
+    res.json({
+      success: true,
+      accounts: [
+        { role: 'superadmin', username: 'superadmin', password: 'Admin1234!' },
+        { role: 'owner',      username: 'owner_test',  password: 'Owner1234!', id: ownerId },
+        { role: 'agent',      username: 'agent_test',  password: 'Agent1234!', owner_id: ownerId }
+      ],
+      note: 'Supprimer cet endpoint après usage !'
+    });
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 
 // ==================== Inscription joueur (publique) ====================
 app.post('/api/auth/player/register', async (req, res) => {
@@ -490,7 +567,11 @@ app.get('/api/owners/active', async (req, res) => {
 
 // ==================== Routes communes ====================
 app.get('/api/lottery-settings', authenticate, async (req, res) => {
-  const ownerId = req.user.ownerId;
+  let ownerId = req.user.ownerId;
+  if (!ownerId) {
+    const userRes = await pool.query('SELECT owner_id FROM users WHERE id = $1', [req.user.id]);
+    ownerId = userRes.rows[0]?.owner_id || req.user.id;
+  }
   try {
     const result = await pool.query(
       'SELECT name, slogan, logo_url, multipliers, limits, address, phone_numbers FROM lottery_settings WHERE owner_id = $1',
@@ -509,7 +590,12 @@ app.get('/api/draws', authenticate, async (req, res) => {
             const result = await pool.query('SELECT id, name, time, color, active, is_special, day_of_week FROM draws ORDER BY time');
             return res.json({ draws: result.rows });
         }
-        const ownerId = user.ownerId;
+        // Fallback: si ownerId absent du JWT, le chercher dans la DB
+        let ownerId = user.ownerId;
+        if (!ownerId) {
+            const userRes = await pool.query('SELECT owner_id FROM users WHERE id = $1', [user.id]);
+            ownerId = userRes.rows[0]?.owner_id || user.id;
+        }
         const currentDay = new Date().getDay();
         const isSunday = (currentDay === 0);
         const result = await pool.query(`
@@ -533,7 +619,11 @@ app.get('/api/draws', authenticate, async (req, res) => {
 });
 
 app.get('/api/blocked-numbers/global', authenticate, async (req, res) => {
-  const ownerId = req.user.ownerId;
+  let ownerId = req.user.ownerId;
+  if (!ownerId) {
+    const userRes = await pool.query('SELECT owner_id FROM users WHERE id = $1', [req.user.id]);
+    ownerId = userRes.rows[0]?.owner_id || req.user.id;
+  }
   try {
     const result = await pool.query('SELECT number FROM global_blocked_numbers WHERE owner_id = $1', [ownerId]);
     res.json({ blockedNumbers: result.rows.map(r => r.number) });
@@ -550,7 +640,11 @@ app.get('/api/blocked-numbers/draw/:drawId', authenticate, async (req, res) => {
 });
 
 app.get('/api/number-limits', authenticate, async (req, res) => {
-  const ownerId = req.user.ownerId;
+  let ownerId = req.user.ownerId;
+  if (!ownerId) {
+    const userRes = await pool.query('SELECT owner_id FROM users WHERE id = $1', [req.user.id]);
+    ownerId = userRes.rows[0]?.owner_id || req.user.id;
+  }
   try {
     const global = await pool.query('SELECT NULL as draw_id, number, limit_amount FROM global_number_limits WHERE owner_id = $1', [ownerId]);
     const draw = await pool.query(
